@@ -14,17 +14,17 @@ class SingleLaneEnv(gym.Env):
                  vl0 = 15.0,
                  x0 = 0.0,
                  v0 = 10.0,
-                 dt = 0.05,
+                 dt = 0.01,
                  macro_dt = 0.5,
                  T = 20.0,
                  v_min = 0.0,
                  v_max = 30.0,
-                 a_min=-3.0,
-                 a_max=2.0,
-                 u_min=-3.0,
-                 u_max=2.0,
+                 a_min=-9.0,
+                 a_max=4.0,
+                 u_min=-9.0,
+                 u_max=4.0,
                  alpha_a=1.0,
-                 alpha_v=0.2,
+                 alpha_v=0.05,
                  alpha_d=2.0,
                  alphaV=0.4
                  ):
@@ -40,6 +40,7 @@ class SingleLaneEnv(gym.Env):
         self.alphaV = float(alphaV)
         self.n_internal = int(np.round(self.macro_dt / self.dt))
         self.n_total = int(np.round(self.T / self.dt))
+        self.n_chunks = self.n_total // self.n_internal
         
         self.v_min, self.v_max = float(v_min), float(v_max)
         self.a_min, self.a_max = float(a_min), float(a_max)
@@ -70,13 +71,15 @@ class SingleLaneEnv(gym.Env):
 
         traj = np.zeros((5, self.n_internal * self.n_total), dtype=np.float64)
         traj[:, 0] = np.array([xl0, vl0, x0, v0, 0], dtype=np.float64)
-        print(traj.shape)
         self.state = {"traj": traj, "t": 0.0}
 
         self.alpha_a = float(alpha_a)
         self.alpha_v = float(alpha_v)
         self.alpha_d = float(alpha_d)
-        self.V = lambda x: np.tanh(x-2) + np.tanh(2)
+
+        t0 = np.tanh(1.0)
+        g0 = (self.v_max - self.v_min) # Caracteristic gap = 2 seconds safety distance at avg speed
+        self.V = lambda x: self.v_min + (self.v_max - self.v_min) * (np.tanh((x-g0)/g0) + t0) / (1 + t0)
 
 
     def reset(self, seed=None, options=None):
@@ -97,31 +100,37 @@ class SingleLaneEnv(gym.Env):
         a_profile = np.clip(action, self.u_min, self.u_max)
         X0 = self.state['traj'][:, int(self.state['t'] / self.dt)]
         t0 = self.state['t']
-        k0 = int(round(self.state["t"] / self.dt))
-        k1 = min(k0 + self.n_internal, self.n_total-1)
-        remaining_steps = k1 - k0 
+        p0 = int(t0 // self.dt)
+        p1 = int((t0 + self.macro_dt) // self.dt)
+        pf = self.n_total - 1
+        remaining_steps = pf - p0
 
         newtraj = np.zeros((5, self.n_total), dtype=np.float64)
-        newtraj[:, :k0+1] = self.state['traj'][:, :k0+1]
+        newtraj[:, :p0+1] = self.state['traj'][:, :p0+1]
+
+        reward = 0.0
+        done = False
 
         X = X0.copy()
         for i in range(remaining_steps):
-            u = a_profile[k0 + i]
+            u = a_profile[p0 + i]
             k1 = self._f(X, u)
             k2 = self._f(X + 0.5 * self.dt * k1, u)
             k3 = self._f(X + 0.5 * self.dt * k2, u)
             k4 = self._f(X + self.dt * k3, u)
             X += (self.dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
 
-            newtraj[:, k0+i+1] = X
+            newtraj[:, p0+i+1] = X
+            if newtraj[:, p0+i+1][0] < newtraj[:, p0+i+1][2]: 
+                # safety check: if the leader is behind the ego, we consider the episode done and give a large negative reward
+                reward -= 100.0
+                done = True
 
         self.state["traj"] = newtraj
-        self.state["t"] = (k0 + remaining_steps) * self.dt
+        self.state["t"] = p1 * self.dt
 
         if self.state["t"] >= self.T:
             done = True
-        else:
-            done = False
         
         reward = self.compute_reward()
 
@@ -147,7 +156,7 @@ class SingleLaneEnv(gym.Env):
         
         integrand = 0.5 * self.alpha_a * (a**2) - self.alpha_v * v
         
-        reward = -np.trapezoid(integrand, dx=self.dt) / self.T - self.alpha_d * (vL[0] - vL[-1])**2
+        reward = -np.trapz(integrand, dx=self.dt) / self.T - self.alpha_d * (vL[0] - vL[-1])**2
         
         return reward
 
@@ -235,6 +244,68 @@ class SingleLaneEnv(gym.Env):
 
     def close(self):
         pass
+
+
+class BasisActionWrapper(gym.Wrapper):
+    """
+    PPO-compatible wrapper:
+    - Action = alpha ∈ R^K (basis coefficients)
+    - Internally builds u(t) over one macro step
+    """
+
+    def __init__(self, env: SingleLaneEnv, K: int):
+        super().__init__(env)
+
+        self.K = K
+        self.tau = env.macro_dt
+        self.dt = env.dt
+        self.steps_per_macro = int(self.tau / self.dt)
+
+        # PPO action space: coefficients alpha_i
+        self.action_space = gym.spaces.Box(
+            low=env.u_min,
+            high=env.u_max,
+            shape=(K,),
+            dtype=np.float32
+        )
+
+        # observation unchanged
+        self.observation_space = env.observation_space
+
+        Phi = np.zeros((K, env.n_total), dtype=np.float32)
+
+        # Bin edges in index space [0, n_total]
+        edges = np.linspace(0, env.n_total, K + 1)
+        edges = np.round(edges).astype(int)
+        edges[0] = 0
+        edges[-1] = env.n_total
+
+        for i in range(K):
+            a, b = edges[i], edges[i + 1]
+            if b > a:
+                Phi[i, a:b] = 1.0
+
+        self.Phi = Phi
+
+    def alpha_to_control(self, alpha, t0_index):
+        """
+        Build full control vector u(t) from alpha
+        """
+        u = alpha @ self.Phi
+        return u
+
+    def step(self, alpha):
+        # current discrete time index
+        t0_index = int(self.env.state["t"] / self.dt)
+
+        # build control trajectory
+        control = self.alpha_to_control(alpha, t0_index)
+
+        # delegate physics + reward to original env
+        obs, reward, done, info = self.env.step(control)
+
+        return obs, reward, done, info
+
 
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
