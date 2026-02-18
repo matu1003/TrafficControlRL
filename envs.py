@@ -24,8 +24,8 @@ class SingleLaneEnv(gym.Env):
                  u_min=-9.0,
                  u_max=4.0,
                  alpha_a=1.0,
-                 alpha_v=0.05,
-                 alpha_d=2.0,
+                 alpha_v=1.0,
+                 alpha_d=1.0,
                  alphaV=0.4
                  ):
         super(SingleLaneEnv, self).__init__()
@@ -73,6 +73,12 @@ class SingleLaneEnv(gym.Env):
         traj[:, 0] = np.array([xl0, vl0, x0, v0, 0], dtype=np.float64)
         self.state = {"traj": traj, "t": 0.0}
 
+        leading_al = np.zeros(self.n_total)
+        t = np.arange(self.n_total)
+        self.leading_al = (a_min + a_max)/2 + (a_max-a_min)/2 * np.sin(2*t*np.pi/(self.n_total))
+
+        self.control = np.zeros(self.n_total)
+        
         self.alpha_a = float(alpha_a)
         self.alpha_v = float(alpha_v)
         self.alpha_d = float(alpha_d)
@@ -100,31 +106,36 @@ class SingleLaneEnv(gym.Env):
         a_profile = np.clip(action, self.u_min, self.u_max)
         X0 = self.state['traj'][:, int(self.state['t'] / self.dt)]
         t0 = self.state['t']
-        p0 = int(t0 // self.dt)
-        p1 = int((t0 + self.macro_dt) // self.dt)
+        p0 = int(round(t0 / self.dt))
+        p1 = int(round((t0 + self.macro_dt) / self.dt))
         pf = self.n_total - 1
         remaining_steps = pf - p0
 
         newtraj = np.zeros((5, self.n_total), dtype=np.float64)
         newtraj[:, :p0+1] = self.state['traj'][:, :p0+1]
+        self.control[p0+1:] = action[p0+1:]
 
         reward = 0.0
-        done = False
+        done = newtraj[0, p0] < newtraj[2, p0]
+        if done:
+            return self._get_obs(), -1e6, True, {}
 
         X = X0.copy()
+        collision = False
         for i in range(remaining_steps):
             u = a_profile[p0 + i]
-            k1 = self._f(X, u)
-            k2 = self._f(X + 0.5 * self.dt * k1, u)
-            k3 = self._f(X + 0.5 * self.dt * k2, u)
-            k4 = self._f(X + self.dt * k3, u)
+            k1 = self._f(X, u, p0+i)
+            k2 = self._f(X + 0.5 * self.dt * k1, u, p0+i)
+            k3 = self._f(X + 0.5 * self.dt * k2, u, p0+i)
+            k4 = self._f(X + self.dt * k3, u, p0+i)
             X += (self.dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
-
+            X[4] = k1[3]
             newtraj[:, p0+i+1] = X
-            if newtraj[:, p0+i+1][0] < newtraj[:, p0+i+1][2]: 
+            if newtraj[:, p0+i+1][0] < newtraj[:, p0+i+1][2] and not collision: 
                 # safety check: if the leader is behind the ego, we consider the episode done and give a large negative reward
-                reward -= 100.0
-                done = True
+                reward -= 1e5
+                collision = True
+
 
         self.state["traj"] = newtraj
         self.state["t"] = p1 * self.dt
@@ -132,11 +143,11 @@ class SingleLaneEnv(gym.Env):
         if self.state["t"] >= self.T:
             done = True
         
-        reward = self.compute_reward()
+        reward += self.compute_reward()
 
         return self._get_obs(), reward, done, {}
 
-    def _f(self, s: np.ndarray, u: float):
+    def _f(self, s: np.ndarray, u: float, i: int = 0):
         '''
         Transition function for the system dynamics.
         
@@ -145,7 +156,7 @@ class SingleLaneEnv(gym.Env):
         '''
         xL, vL, x, v, a = s
         dxL = vL
-        dvL = 0.0
+        dvL = self.leading_al[i]
         dx = v
         dv = self.alphaV * ( self.V(xL - x) - v) + u
         da = 0.0
@@ -154,20 +165,21 @@ class SingleLaneEnv(gym.Env):
     def compute_reward(self):
         xL, vL, x, v, a = self.state["traj"]
         
-        integrand = 0.5 * self.alpha_a * (a**2) - self.alpha_v * v
+        integrand = 0.5 * self.alpha_a * ((a/self.a_max)**2) - self.alpha_v * v/self.v_max
         
         reward = -np.trapz(integrand, dx=self.dt) / self.T - self.alpha_d * (vL[0] - vL[-1])**2
-        
         return reward
 
     def _get_obs(self):
         return self.state, {}
 
-    def render(self, control):
+    def render(self):
         N = self.n_total
 
         t = np.arange(N) * self.dt
-        k = int(np.round(self.state["t"] / self.dt))
+        k = int(round(self.state["t"] / self.dt))
+        if k >= N:
+            return
 
 
         xL, vL, x, v, a = self.state["traj"]
@@ -217,7 +229,19 @@ class SingleLaneEnv(gym.Env):
 
 
         # ---------- control ----------
-        ax_u.plot(t[:k+1], control[:k+1], "C2-", label="planned control")
+        uc = np.clip(self.control, self.u_min, self.u_max)
+        ax_u.plot(t[:k+1], uc[:k+1], "C2-", label="Applied control")
+        ax_u.plot(t[k:], uc[k:], "C2--", alpha=0.6, label="Planned control")
+
+        # ---------- acceleration ----------
+        ax_u.plot(t[:k+1], a[:k+1], "C3-", label="Accleration history")
+        ax_u.plot(t[k:], a[k:], "C3--", alpha=0.6, label="Simulated acceleration")
+
+        
+        # ---------- leading acceleration ----------
+        al = self.leading_al
+        ax_u.plot(t[:k+1], al[:k+1], "C4-", label="Leading Accleration history")
+        ax_u.plot(t[k:], al[k:], "C4--", alpha=0.6, label="Leading Simulated acceleration")
 
 
         # highlight last applied chunk
@@ -229,7 +253,7 @@ class SingleLaneEnv(gym.Env):
 
 
         ax_u.axvline(t[k], color="k", linestyle=":")
-        ax_u.set_ylabel("Acceleration")
+        ax_u.set_ylabel("Acceleration/Control")
         ax_u.set_xlabel("Time [s]")
         ax_u.grid(True)
         ax_u.legend(loc="upper right")
@@ -299,6 +323,7 @@ class BasisActionWrapper(gym.Wrapper):
         t0_index = int(self.env.state["t"] / self.dt)
 
         # build control trajectory
+        alpha = np.clip(alpha, self.env.u_min, self.env.u_max)
         control = self.alpha_to_control(alpha, t0_index)
 
         # delegate physics + reward to original env
