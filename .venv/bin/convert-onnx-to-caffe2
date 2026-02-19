@@ -1,8 +1,0 @@
-#!/bin/sh
-'''exec' "/Users/mat/Desktop/Cours X/3A/Research project/Code/.venv/bin/python" "$0" "$@"
-' '''
-import sys
-from caffe2.python.onnx.bin.conversion import onnx_to_caffe2
-if __name__ == '__main__':
-    sys.argv[0] = sys.argv[0].removesuffix('.exe')
-    sys.exit(onnx_to_caffe2())
