@@ -132,7 +132,7 @@ class SingleLaneEnv(gym.Env):
             X[4] = k1[3]
             newtraj[:, p0+i+1] = X
             if newtraj[:, p0+i+1][0] < newtraj[:, p0+i+1][2] and not collision: 
-                # safety check: if the leader is behind the ego, we consider the episode done and give a large negative reward
+                # safety check: if the leader is behind the ego, we give a large negative reward
                 reward -= 1e5
                 collision = True
 
@@ -167,7 +167,7 @@ class SingleLaneEnv(gym.Env):
         
         integrand = 0.5 * self.alpha_a * ((a/self.a_max)**2) - self.alpha_v * v/self.v_max
         
-        reward = -np.trapz(integrand, dx=self.dt) / self.T - self.alpha_d * (vL[0] - vL[-1])**2
+        reward = -np.trapz(integrand, dx=self.dt) / self.T 
         return reward
 
     def _get_obs(self):

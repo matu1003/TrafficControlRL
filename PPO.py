@@ -59,6 +59,25 @@ class PPO():
 
         self.actor = Actor(obs_dim, act_dim, actor_shape).to(device)
         self.critic = Critic(obs_dim, critic_shape).to(device)
+
+        base = env.unwrapped
+        self.scale = (base.u_max - base.u_min)/2
+        self.bias  = (base.u_max + base.u_min)/2
+    
+
+    def sample_action(self, obs):
+        mu, std = self.actor(obs)
+        dist = Normal(mu, std)
+
+        z = dist.rsample()
+        action = torch.tanh(z)
+
+        action_env = self.scale * action + self.bias
+
+        logp = dist.log_prob(z) - torch.log(1 - action.pow(2) + 1e-6) - np.log(self.scale)
+        logp = logp.sum(dim=-1)
+        return action_env, logp, mu, std, dist, z, action
+
         
     def fit(self, episodes=100,
         n_epochs=1,
@@ -88,7 +107,7 @@ class PPO():
         for ep in pbar:
             obs, _ = env.reset()
             
-            obs_buf, act_buf, rew_buf, done_buf, logp_old_buf, val_buf = [], [], [], [], [], []
+            obs_buf, act_buf, rew_buf, done_buf, logp_old_buf, val_buf, z_buf = [], [], [], [], [], [], []
 
             ep_return = 0.0
             base_env = env.unwrapped
@@ -101,27 +120,23 @@ class PPO():
                 obs_tensor = torch.from_numpy(obs_vec).float().unsqueeze(0).to(device)
 
                 with torch.no_grad():
-                    mu, std = actor(obs_tensor)
-                    dist = Normal(mu, std)
-
-                    action = torch.tanh(dist.rsample())  # (1, act_dim)
-                    logp = dist.log_prob(action).sum(dim=-1)  # (1,)
-                    value = critic(obs_tensor)  # (1,)
+                    action_env, logp, mu, std, dist, z, action = self.sample_action(obs_tensor)
+                    value = critic(obs_tensor)           # V(s)
 
                 # step env
-                action = 0.5 * (action + 1.0) * (env.env.u_max - env.env.u_min) + env.env.u_min
-                step_out = env.step(action.squeeze(0).cpu().numpy())
-                # your env returns: ((obs, info), reward, done, info)
+                step_out = env.step(action_env.squeeze(0).cpu().numpy())
+
                 obs_out, reward, done, info = step_out
                 next_obs = obs_out[0]  # Extract the observation from the tuple returned by env.step()
 
                 # store
                 obs_buf.append(obs_vec)
-                act_buf.append(action.squeeze(0).cpu().numpy())
+                act_buf.append(action_env.squeeze(0).cpu().numpy())
                 rew_buf.append(float(reward))
                 done_buf.append(float(done))
                 logp_old_buf.append(float(logp.item()))
                 val_buf.append(float(value.item()))
+                z_buf.append(z.squeeze(0).cpu().numpy())
 
                 ep_return += float(reward)
                 global_step += 1
@@ -133,6 +148,7 @@ class PPO():
             # ---- tensors ----
             obs_t = torch.tensor(np.array(obs_buf), dtype=torch.float32, device=device)          # (T, obs_dim)
             act_t = torch.tensor(np.array(act_buf), dtype=torch.float32, device=device)          # (T, act_dim)
+            z_t = torch.tensor(np.array(z_buf), dtype=torch.float32, device=device)              # (T, act_dim)
             rew_t = torch.tensor(np.array(rew_buf), dtype=torch.float32, device=device)          # (T,)
             done_t = torch.tensor(np.array(done_buf), dtype=torch.float32, device=device)        # (T,)
             logp_old_t = torch.tensor(np.array(logp_old_buf), dtype=torch.float32, device=device)# (T,)
@@ -170,13 +186,18 @@ class PPO():
                     mb = idxs[start:start + batch_size]
                     batch_obs = obs_t[mb]         # (B, obs_dim)
                     batch_act = act_t[mb]         # (B, act_dim)
+                    batch_z = z_t[mb]             # (B, act_dim)
                     batch_logp_old = logp_old_t[mb] # (B,)
                     batch_adv = adv[mb]           # (B,)
                     batch_ret = returns[mb]       # (B,)
 
                     mu, std = actor(batch_obs)
                     dist = Normal(mu, std)
-                    logp_new = dist.log_prob(batch_act).sum(dim=-1)  # (B,)
+
+                    z = batch_z
+                    action = torch.tanh(z)
+                    logp_new = dist.log_prob(z) - torch.log(1 - action.pow(2) + 1e-6) - np.log(self.scale)
+                    logp_new = logp_new.sum(dim=-1)
 
                     ratio = torch.exp(logp_new - batch_logp_old)
 
@@ -231,7 +252,7 @@ class PPO():
 
                 writer.add_scalar("diagnostics/approx_kl", kl_acc / max(n_mb, 1), ep)
                 writer.add_scalar("diagnostics/clipfrac", clipfrac_acc / max(n_mb, 1), ep)
-                writer.add_scalar("diagnostics/entropy", ent_acc / max(n_mb, 1), ep)
+                writer.add_scalar("diagnostics/zspaceentropy", ent_acc / max(n_mb, 1), ep)
                 writer.add_scalar("diagnostics/mean_std", std_acc / max(n_mb, 1), ep)
                 writer.add_scalar("diagnostics/mean_mu", mu_acc / max(n_mb, 1), ep)
 
@@ -257,7 +278,8 @@ class PPO():
 if __name__ == "__main__":
     base_env = SingleLaneEnv(T=20.0, dt = 0.02, macro_dt=0.4)
 
-    K_value = base_env.n_chunks
+    # K_value = base_env.n_chunks
+    K_value = 10
 
     wrapped_env = BasisActionWrapper(base_env, K=K_value)
 
@@ -265,4 +287,4 @@ if __name__ == "__main__":
 
     Ppo = PPO(wrapped_env, actor_shape=[64], critic_shape=[64])
 
-    actor, critic = Ppo.fit(episodes=100000, lr=1e-4, exp_num=8, clip_eps=0.3)
+    actor, critic = Ppo.fit(episodes=100000, lr=1e-5, exp_num=12, clip_eps=0.3)
