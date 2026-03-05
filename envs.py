@@ -26,7 +26,8 @@ class SingleLaneEnv(gym.Env):
                  alpha_a=1.0,
                  alpha_v=1.0,
                  alpha_d=1.0,
-                 alphaV=0.4
+                 alphaV=0.4,
+                 al = 3
                  ):
         super(SingleLaneEnv, self).__init__()
         self.xl0 = float(xl0)
@@ -73,9 +74,11 @@ class SingleLaneEnv(gym.Env):
         traj[:, 0] = np.array([xl0, vl0, x0, v0, 0], dtype=np.float64)
         self.state = {"traj": traj, "t": 0.0}
 
-        leading_al = np.zeros(self.n_total)
         t = np.arange(self.n_total)
-        self.leading_al = (a_min + a_max)/2 + (a_max-a_min)/2 * np.sin(2*t*np.pi/(self.n_total))
+
+
+        
+        self.leading_al =  a_max/2 * (1 + np.sin(al*t*np.pi/(self.n_total)))
 
         self.control = np.zeros(self.n_total)
         
@@ -91,12 +94,26 @@ class SingleLaneEnv(gym.Env):
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
 
-        traj = np.zeros((5, self.n_total), dtype=np.float64)
-        traj[:, 0] = np.array([self.xl0, self.vl0, self.x0, self.v0, 0], dtype=np.float64)
+        traj = np.zeros((5, self.n_total), dtype=np.float32)
+        traj[:, 0] = np.array([self.xl0, self.vl0, self.x0, self.v0, 0], dtype=np.float32)
+
+        X = traj[:, 0].astype(np.float64, copy=True)
+
+        for i in range(self.n_total - 1):
+            u = 0.0
+            k1 = self._f(X, u, i)
+            k2 = self._f(X + 0.5 * self.dt * k1, u, i)
+            k3 = self._f(X + 0.5 * self.dt * k2, u, i)
+            k4 = self._f(X + self.dt * k3, u, i)
+            X = X + (self.dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
+
+            X[4] = k1[3]
+
+            traj[:, i + 1] = X.astype(np.float32, copy=False)
 
         self.state = {"traj": traj, "t": 0.0}
-
-        return self._get_obs()
+        info = {}
+        return self._get_obs(), info
 
     def step(self, action):
         '''
@@ -118,10 +135,9 @@ class SingleLaneEnv(gym.Env):
         reward = 0.0
         done = newtraj[0, p0] < newtraj[2, p0]
         if done:
-            return self._get_obs(), -1e6, True, {}
+            return self._get_obs(), -1e2, True, False, {}
 
         X = X0.copy()
-        collision = False
         for i in range(remaining_steps):
             u = a_profile[p0 + i]
             k1 = self._f(X, u, p0+i)
@@ -131,10 +147,6 @@ class SingleLaneEnv(gym.Env):
             X += (self.dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
             X[4] = k1[3]
             newtraj[:, p0+i+1] = X
-            if newtraj[:, p0+i+1][0] < newtraj[:, p0+i+1][2] and not collision: 
-                # safety check: if the leader is behind the ego, we give a large negative reward
-                reward -= 1e5
-                collision = True
 
 
         self.state["traj"] = newtraj
@@ -145,7 +157,13 @@ class SingleLaneEnv(gym.Env):
         
         reward += self.compute_reward()
 
-        return self._get_obs(), reward, done, {}
+        terminated = done
+
+        truncated = self.state["t"] >= self.T
+
+        info = {}
+
+        return self._get_obs(), reward, terminated, truncated, info
 
     def _f(self, s: np.ndarray, u: float, i: int = 0):
         '''
@@ -158,7 +176,8 @@ class SingleLaneEnv(gym.Env):
         dxL = vL
         dvL = self.leading_al[i]
         dx = v
-        dv = self.alphaV * ( self.V(xL - x) - v) + u
+        # dv = self.alphaV * ( self.V(xL - x) - v) + u
+        dv = u
         da = 0.0
         return np.array([dxL, dvL, dx, dv, da], dtype=np.float64)
     
@@ -170,8 +189,11 @@ class SingleLaneEnv(gym.Env):
         reward = -np.trapz(integrand, dx=self.dt) / self.T 
         return reward
 
+
     def _get_obs(self):
-        return self.state, {}
+        traj = self.state["traj"].astype(np.float32, copy=False)
+        t = np.array([self.state["t"]], dtype=np.float32)  # shape (1,)
+        return {"traj": traj, "t": t}
 
     def render(self):
         N = self.n_total
@@ -187,16 +209,21 @@ class SingleLaneEnv(gym.Env):
 
         # create figure once
         if not hasattr(self, "_fig"):
-            self._fig, self._axs = plt.subplots(
-            3, 1, figsize=(10, 8), sharex=True
-            )
+            self._fig = plt.figure(figsize=(10,8))
+            gs = self._fig.add_gridspec(4,1)
+            ax_pos = self._fig.add_subplot(gs[0])
+            ax_vel = self._fig.add_subplot(gs[1], sharex=ax_pos)
+            ax_u   = self._fig.add_subplot(gs[2], sharex=ax_pos)
+            ax_phase = self._fig.add_subplot(gs[3]) 
+            self._axs = (ax_pos, ax_vel, ax_u, ax_phase)
         plt.ion()
 
 
-        ax_pos, ax_vel, ax_u = self._axs
+        ax_pos, ax_vel, ax_u, ax_phase = self._axs
         ax_pos.clear()
         ax_vel.clear()
         ax_u.clear()
+        ax_phase.clear()
 
 
         # ---------- positions ----------
@@ -242,6 +269,15 @@ class SingleLaneEnv(gym.Env):
         al = self.leading_al
         ax_u.plot(t[:k+1], al[:k+1], "C4-", label="Leading Accleration history")
         ax_u.plot(t[k:], al[k:], "C4--", alpha=0.6, label="Leading Simulated acceleration")
+
+        # ----------- phase portrait (v, xL-x) ----------
+        ax_phase.plot(xL[:k+1] - x[:k+1], vL[:k+1] - v[:k+1], "C1-", label="Phase portrait (past)")
+        ax_phase.plot(xL[k:] - x[k:], vL[k:] - v[k:], "C1--", alpha=0.6, label="Phase portrait (projected)")
+        ax_phase.axvline(0, color="k", linestyle=":")
+        ax_phase.set_xlabel("Gap (xL - x)")
+        ax_phase.set_ylabel("Velocity")
+        ax_phase.legend(loc="upper right")
+        ax_phase.grid(True)
 
 
         # highlight last applied chunk
@@ -327,9 +363,9 @@ class BasisActionWrapper(gym.Wrapper):
         control = self.alpha_to_control(alpha, t0_index)
 
         # delegate physics + reward to original env
-        obs, reward, done, info = self.env.step(control)
+        obs, reward, terminated, truncated, info = self.env.step(control)
 
-        return obs, reward, done, info
+        return obs, reward, terminated, truncated, info
 
 
 if __name__ == "__main__":

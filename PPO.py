@@ -25,7 +25,7 @@ class Actor(nn.Module):
     def forward(self, obs):
         x = self.net(obs)
         mu = self.mu_head(x)
-        logstd = self.logstd_head(x).clamp(-5, 2)
+        logstd = self.logstd_head(x).clamp(-2, 2)
         std = logstd.exp()
         return mu, std
     
@@ -74,15 +74,16 @@ class PPO():
 
         action_env = self.scale * action + self.bias
 
-        logp = dist.log_prob(z) - torch.log(1 - action.pow(2) + 1e-6) - np.log(self.scale)
+        logp = dist.log_prob(z) - torch.log(1 - action.pow(2) + 1e-6)
         logp = logp.sum(dim=-1)
         return action_env, logp, mu, std, dist, z, action
 
         
     def fit(self, episodes=100,
         n_epochs=1,
-        batch_size=32,
-        lr=1e-4,
+        batch_size=16,
+        policy_lr=3e-4,
+        value_lr=1e-3,
         gamma=0.99,
         clip_eps=0.2,
         exp_num=0,
@@ -98,7 +99,8 @@ class PPO():
         critic = self.critic
 
         
-        optimizer = torch.optim.Adam(list(actor.parameters()) + list(critic.parameters()), lr=lr)
+        pi_optimizer = torch.optim.Adam(actor.parameters(), lr=policy_lr)
+        vf_optimizer = torch.optim.Adam(critic.parameters(), lr=value_lr)
 
         global_step = 0
         best_return = -float("inf")
@@ -126,14 +128,14 @@ class PPO():
                 # step env
                 step_out = env.step(action_env.squeeze(0).cpu().numpy())
 
-                obs_out, reward, done, info = step_out
+                obs_out, reward, terminated, truncated, info = step_out
                 next_obs = obs_out[0]  # Extract the observation from the tuple returned by env.step()
 
                 # store
                 obs_buf.append(obs_vec)
                 act_buf.append(action_env.squeeze(0).cpu().numpy())
                 rew_buf.append(float(reward))
-                done_buf.append(float(done))
+                done_buf.append(float(terminated))
                 logp_old_buf.append(float(logp.item()))
                 val_buf.append(float(value.item()))
                 z_buf.append(z.squeeze(0).cpu().numpy())
@@ -142,7 +144,7 @@ class PPO():
                 global_step += 1
 
                 obs = next_obs
-                if done:
+                if terminated:
                     break
 
             # ---- tensors ----
@@ -196,7 +198,7 @@ class PPO():
 
                     z = batch_z
                     action = torch.tanh(z)
-                    logp_new = dist.log_prob(z) - torch.log(1 - action.pow(2) + 1e-6) - np.log(self.scale)
+                    logp_new = dist.log_prob(z) - torch.log(1 - action.pow(2) + 1e-6)
                     logp_new = logp_new.sum(dim=-1)
 
                     ratio = torch.exp(logp_new - batch_logp_old)
@@ -208,18 +210,22 @@ class PPO():
                     value_pred = critic(batch_obs)
                     critic_loss = nn.MSELoss()(value_pred, batch_ret)
 
-                    loss = actor_loss + critic_loss
+                    entropy = dist.entropy().sum(-1).mean()
+                    ent_coef = 0.001
+                    loss = actor_loss + critic_loss - ent_coef * entropy
 
-                    optimizer.zero_grad()
+                    pi_optimizer.zero_grad()
+                    vf_optimizer.zero_grad()
                     loss.backward()
-                    nn.utils.clip_grad_norm_(list(actor.parameters()) + list(critic.parameters()), 1.0)
-                    optimizer.step()
+                    nn.utils.clip_grad_norm_(actor.parameters(), 1.0)
+                    pi_optimizer.step()
+                    vf_optimizer.step()
 
                     # ---- diagnostics (no grad) ----
                     with torch.no_grad():
                         approx_kl = (batch_logp_old - logp_new).mean()
                         clipfrac = (torch.abs(ratio - 1.0) > clip_eps).float().mean()
-                        entropy = dist.entropy().sum(dim=-1).mean()
+                        entropy = entropy
                         mean_std = std.mean()
                         min_std  = std.min()
                         max_std  = std.max()
@@ -252,7 +258,7 @@ class PPO():
 
                 writer.add_scalar("diagnostics/approx_kl", kl_acc / max(n_mb, 1), ep)
                 writer.add_scalar("diagnostics/clipfrac", clipfrac_acc / max(n_mb, 1), ep)
-                writer.add_scalar("diagnostics/zspaceentropy", ent_acc / max(n_mb, 1), ep)
+                writer.add_scalar("diagnostics/entropy", ent_acc / max(n_mb, 1), ep)
                 writer.add_scalar("diagnostics/mean_std", std_acc / max(n_mb, 1), ep)
                 writer.add_scalar("diagnostics/mean_mu", mu_acc / max(n_mb, 1), ep)
 
@@ -263,6 +269,25 @@ class PPO():
                 writer.add_scalar("diagnostics/mu_max", max_mu.item(), ep)
                 writer.add_scalar("diagnostics/logp_min", min_logp.item(), ep)
                 writer.add_scalar("diagnostics/logp_max", max_logp.item(), ep)
+
+                delta = (logp_new - batch_logp_old)
+                writer.add_scalar("debug/delta_logp_std", delta.float().std(unbiased=False).item(), ep)
+                writer.add_scalar("debug/delta_logp_mean", delta.mean().item(), ep)
+                delta = (logp_new - batch_logp_old)
+                writer.add_scalar("debug/ratio_mean", ratio.mean().item(), ep)
+                writer.add_scalar("debug/ratio_std", ratio.float().std(unbiased=False).item(), ep)
+                writer.add_scalar("debug/ratio_min", ratio.min().item(), ep)
+                writer.add_scalar("debug/ratio_max", ratio.max().item(), ep)
+
+                with torch.no_grad():
+                    # combien de dimensions sont au plancher ?
+                    frac_std_min = (std < 0.14).float().mean()
+
+                    # distance normalisée
+                    norm_dist = ((batch_z - mu) / (std + 1e-8)).abs().mean()
+
+                writer.add_scalar("debug/frac_std_min", frac_std_min.item(), ep)
+                writer.add_scalar("debug/norm_dist", norm_dist.item(), ep)
 
 
 
@@ -276,10 +301,10 @@ class PPO():
         return actor, critic
 
 if __name__ == "__main__":
-    base_env = SingleLaneEnv(T=20.0, dt = 0.02, macro_dt=0.4)
+    base_env = SingleLaneEnv(T=10.0, dt = 0.05, macro_dt=1.0)
 
     # K_value = base_env.n_chunks
-    K_value = 10
+    K_value = 4
 
     wrapped_env = BasisActionWrapper(base_env, K=K_value)
 
@@ -287,4 +312,4 @@ if __name__ == "__main__":
 
     Ppo = PPO(wrapped_env, actor_shape=[64], critic_shape=[64])
 
-    actor, critic = Ppo.fit(episodes=100000, lr=1e-5, exp_num=12, clip_eps=0.3)
+    actor, critic = Ppo.fit(episodes=100000, policy_lr=5e-3, value_lr=1e-2, exp_num=15, clip_eps=0.3)
