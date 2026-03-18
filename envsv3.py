@@ -176,7 +176,7 @@ class SingleLaneEnv(gym.Env):
         dxL = vL
         dvL = self.leading_al[i]
         dx = v
-        dv = self.alphaV * ( self.V(xL - x) - v) + u + 
+        dv = self.alphaV * ( self.V(xL - x) - v) + u
         # dv = u
         da = 0.0
         return np.array([dxL, dvL, dx, dv, da], dtype=np.float64)
@@ -575,6 +575,11 @@ class SafetyWrapper(gym.Wrapper):
             ax_safe.plot(sh["t"], sh["u_safe"],    "C3-",  label="u_safe (CBF)")
             ax_safe.plot(sh["t"], sh["u_target"],  "C4--", label="u_target (OV)")
             ax_safe.plot(sh["t"], sh["u_applied"], "C2-",  linewidth=2, label="u_applied")
+            # scale y-axis based on all signals except u_safe
+            other_vals = sh["u_c"] + sh["u_target"] + sh["u_applied"]
+            if other_vals:
+                margin = 0.05 * (max(other_vals) - min(other_vals) + 1e-6)
+                ax_safe.set_ylim(min(other_vals) - margin, max(other_vals) + margin)
         ax_safe.axvline(t[k], color="k", linestyle=":")
         ax_safe.set_ylabel("Control (m/s²)")
         ax_safe.set_xlabel("Time [s]")
