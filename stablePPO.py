@@ -16,13 +16,14 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor, VecNormalize
 from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
 from stable_baselines3.common.logger import configure
+from stable_baselines3.common.utils import get_linear_fn
 
-from envs import SingleLaneEnv, BasisActionWrapper  # <-- /mnt/data/envs.py
+# from envs import SingleLaneEnv, BasisActionWrapper  # <-- /mnt/data/envs.py
+from envsv2 import SingleLaneEnv, BasisActionWrapper  # <-- /mnt/data/envsv2.py (version avec reward modifié)
 
-
-def make_env(seed: int = 0, K: int = 10, T: float = 40.0, dt: float = 0.05, macro_dt: float = 1.0, al = 8):
+def make_env(seed: int = 0, K: int = 20, T: float = 40.0, dt: float = 0.05, macro_dt: float = 1.0, al = 8):
     def _thunk():
-        env = SingleLaneEnv(T=T, dt=dt, macro_dt=macro_dt)
+        env = SingleLaneEnv(T=T, dt=dt, macro_dt=macro_dt, al=al)
         env = BasisActionWrapper(env, K=K) 
         env.reset(seed=seed)
         return env
@@ -30,7 +31,7 @@ def make_env(seed: int = 0, K: int = 10, T: float = 40.0, dt: float = 0.05, macr
 
 
 if __name__ == "__main__":
-    exp_n = 3
+    exp_n = 9
     run_dir = os.path.expanduser(f"~/tb_logs/runs/ppo_singlelane_stable_{exp_n}")
     os.makedirs(run_dir, exist_ok=True)
 
@@ -56,11 +57,11 @@ if __name__ == "__main__":
     model = PPO(
         policy="MultiInputPolicy",
         env=train_env,
-        learning_rate=1e-4,
-        n_steps=2048,
-        batch_size=256,
+        learning_rate=get_linear_fn(3e-4, 1e-5, 1.0),
+        n_steps=4096,
+        batch_size=512,
         n_epochs=5,
-        gamma=0.99,
+        gamma=0.999,
         gae_lambda=0.95,
         clip_range=0.2,
         ent_coef=0.0,
@@ -69,7 +70,9 @@ if __name__ == "__main__":
         tensorboard_log=run_dir,
         verbose=1,
         device="auto",
-        # policy_kwargs=dict(net_arch=dict(pi=[256, 256], vf=[256, 256]))  # optionnel
+        policy_kwargs=dict(
+        net_arch=dict(pi=[512, 512, 256], vf=[512, 512, 256])
+    ),
     )
     model.set_logger(logger)
 
@@ -104,7 +107,7 @@ if __name__ == "__main__":
 
     # ====== QUICK ROLLOUT (1 épisode) ======
     # Pour évaluer correctement, recharge VecNormalize en mode eval (reward non normalisé)
-    env = DummyVecEnv([make_env(seed=999)])
+    env = DummyVecEnv([make_env(seed=999, K = 20)])
     env = VecNormalize.load(os.path.join(run_dir, "vecnormalize.pkl"), env)
     env.training = False
     env.norm_reward = False

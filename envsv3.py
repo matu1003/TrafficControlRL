@@ -64,7 +64,7 @@ class SingleLaneEnv(gym.Env):
             np.full((self.n_total,), self.v_max, dtype=np.float32),
             np.full((self.n_total,), 1e6, dtype=np.float32),
             np.full((self.n_total,), self.v_max, dtype=np.float32),
-            np.full((self.n_total,), self.a_max, dtype=np.float32)], dtype=np.float32)
+            np.full((self.n_total,), self.a_max, dtype=np.float32)])
         self.observation_space = gym.spaces.Dict({
             "traj": gym.spaces.Box(low=obs_low, high=obs_high, dtype=np.float32, shape=(5, self.n_total)),
             "t": gym.spaces.Box(low=0.0, high=self.T, shape=(1,), dtype=np.float32),
@@ -176,8 +176,8 @@ class SingleLaneEnv(gym.Env):
         dxL = vL
         dvL = self.leading_al[i]
         dx = v
-        dv = self.alphaV * ( self.V(xL - x) - v) + u
-        dv = u
+        dv = self.alphaV * ( self.V(xL - x) - v) + u + 
+        # dv = u
         da = 0.0
         return np.array([dxL, dvL, dx, dv, da], dtype=np.float64)
     
@@ -185,7 +185,6 @@ class SingleLaneEnv(gym.Env):
         xL, vL, x, v, a = self.state["traj"]
         
         integrand = 0.5 * self.alpha_a * ((a/self.a_max)**2) - self.alpha_v * v/self.v_max + self.alpha_d * ((vL - v)/self.v_max)**2
-        # integrand = 0.5 * self.alpha_a * ((a/self.a_max)**2) - self.alpha_v * v/self.v_max
         
         reward = -np.trapz(integrand, dx=self.dt) / self.T 
         return reward
@@ -193,7 +192,7 @@ class SingleLaneEnv(gym.Env):
 
     def _get_obs(self):
         traj = self.state["traj"].astype(np.float32, copy=False)
-        t = np.array([self.state["t"]], dtype=np.float32)  # shape (1,)
+        t = np.array([self.state["t"]], dtype=np.float32)
         return {"traj": traj, "t": t}
 
     def render(self):
@@ -367,6 +366,227 @@ class BasisActionWrapper(gym.Wrapper):
         obs, reward, terminated, truncated, info = self.env.step(control)
 
         return obs, reward, terminated, truncated, info
+
+
+class SafetyWrapper(gym.Wrapper):
+    """
+    Layered safety filter implementing:
+        u(t) = min{ u_target(t), u_c(t), u_safe(t) }
+
+    where:
+        u_target = alphaV * (V(h) - v)          [OV model: soft following]
+        u_safe   = alphaV * (v_safe - v) + dv_safe/dt  [CBF: hard safety]
+        u_c      = RL policy output              [performance]
+
+    v_safe(t) = sqrt( 2*|a_min| * (h - h0 + 0.5 * vL^2 / |aL_min|) )
+
+    Parameters
+    ----------
+    h0        : minimum standstill gap (m), default 2.0
+    alphaV    : gain for both u_target and u_safe, default 1.0
+    """
+
+    def __init__(self, env: gym.Env, h0: float = 2.0, alphaV: float = 1.0, beta: float = 1.0):
+        super().__init__(env)
+        self.h0 = float(h0)
+        self.alphaV = float(alphaV)
+        self.beta = float(beta)  # gain on the CBF derivative term d(v_safe)/dt
+
+    # ------------------------------------------------------------------
+    # helpers
+    # ------------------------------------------------------------------
+
+    def _v_safe(self, h: float, vL: float, aL_min: float) -> float:
+        """
+        Maximum ego speed that guarantees no collision assuming worst-case
+        leader braking at aL_min (negative value expected).
+        """
+        aL_min_abs = abs(aL_min)
+        a_min_abs  = abs(self.unwrapped.a_min)  # ego max braking
+
+        inner = h - self.h0 + 0.5 * vL**2 / (aL_min_abs + 1e-8)
+        inner = max(inner, 0.0)           # clamp: never take sqrt of negative
+        return np.sqrt(2.0 * a_min_abs * inner)
+
+    def _u_safe(self, h: float, v: float, vL: float,
+                aL_min: float, prev_vs: float, dt: float) -> float:
+        """
+        CBF-derived control:  u_safe = alphaV*(v_safe - v) + d(v_safe)/dt
+        d(v_safe)/dt is approximated by finite difference with previous step.
+        """
+        vs = self._v_safe(h, vL, aL_min)
+        dvs_dt = (vs - prev_vs) / dt
+        return self.alphaV * (vs - v) + self.beta * dvs_dt
+
+    def _u_target(self, h: float, v: float) -> float:
+        """OV model: drive toward the desired speed V(gap)."""
+        return self.alphaV * (self.unwrapped.V(h) - v)
+
+    # ------------------------------------------------------------------
+    # step: intercept action, apply filter, delegate to inner env
+    # ------------------------------------------------------------------
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        base = self.unwrapped
+        xL, vL, x, v, a = base.state["traj"][:, 0]
+        aL_min = float(np.min(base.leading_al))
+        self._prev_vs = self._v_safe(xL - x, vL, aL_min)
+        self._safety_history = {"u_c": [], "u_safe": [], "u_target": [], "u_applied": [], "t": []}
+        return obs, info
+
+    def step(self, action):
+        """
+        action  : u_c control profile, shape (n_total,) or (K,) depending on
+                  whether BasisActionWrapper is stacked below/above.
+                  We filter pointwise at the current timestep only.
+        """
+        # current state
+        base  = self.unwrapped
+        p0    = int(round(base.state["t"] / base.dt))
+        p0    = min(p0, base.n_total - 1)
+        xL, vL, x, v, a = base.state["traj"][:, p0]
+        h     = float(xL - x)
+        v     = float(v)
+        vL    = float(vL)
+
+        # worst-case leader deceleration over remaining horizon
+        p_end   = base.n_total
+        aL_min  = float(np.min(base.leading_al[p0:p_end]))
+
+        # compute the three candidate controls (scalar)
+        u_target = self._u_target(h, v)
+        u_safe   = self._u_safe(h, v, vL, aL_min, self._prev_vs, base.dt)
+        if hasattr(action, '__len__') and len(action) < base.n_total:
+            # action is K basis coefficients — map p0 to the corresponding bin
+            K = len(action)
+            bin_idx = min(int(p0 * K / base.n_total), K - 1)
+            u_c = float(action[bin_idx])
+        elif hasattr(action, '__len__'):
+            u_c = float(action[p0])
+        else:
+            u_c = float(action)
+
+        u_applied = min(u_target, u_c, u_safe)
+        u_applied = float(np.clip(u_applied, base.u_min, base.u_max))
+
+        # update v_safe memory for next d/dt estimate
+        xL_n, vL_n, x_n, v_n, _ = base.state["traj"][:, min(p0+1, base.n_total-1)]
+        self._prev_vs = self._v_safe(float(xL_n - x_n), float(vL_n), aL_min)
+
+        # overwrite current-step control in the action vector
+        if hasattr(action, '__len__') and len(action) < base.n_total:
+            action_filtered = action.copy()
+            action_filtered[bin_idx:] = u_applied  # clamp remaining bins
+        elif hasattr(action, '__len__'):
+            action_filtered = action.copy()
+            action_filtered[p0:] = u_applied
+        else:
+            action_filtered = u_applied
+
+        obs, reward, terminated, truncated, info = self.env.step(action_filtered)
+        info["u_safe"]    = u_safe
+        info["u_target"]  = u_target
+        info["u_c"]       = u_c
+        info["u_applied"] = u_applied
+
+        if not hasattr(self, "_safety_history"):
+            self._safety_history = {"u_c": [], "u_safe": [], "u_target": [], "u_applied": [], "t": []}
+        self._safety_history["u_c"].append(u_c)
+        self._safety_history["u_safe"].append(u_safe)
+        self._safety_history["u_target"].append(u_target)
+        self._safety_history["u_applied"].append(u_applied)
+        self._safety_history["t"].append(p0 * base.dt)
+
+        return obs, reward, terminated, truncated, info
+
+    def render(self):
+        base = self.unwrapped
+        N  = base.n_total
+        t  = np.arange(N) * base.dt
+        k  = min(int(round(base.state["t"] / base.dt)), N - 1)
+
+        xL, vL, x, v, a = base.state["traj"]
+        al = base.leading_al
+
+        if not hasattr(self, "_fig"):
+            self._fig = plt.figure(figsize=(11, 12))
+            gs = self._fig.add_gridspec(5, 1)
+            self._axs = (
+                self._fig.add_subplot(gs[0]),
+                self._fig.add_subplot(gs[1]),
+                self._fig.add_subplot(gs[2]),
+                self._fig.add_subplot(gs[3]),
+                self._fig.add_subplot(gs[4]),
+            )
+        plt.ion()
+
+        ax_pos, ax_vel, ax_u, ax_phase, ax_safe = self._axs
+        for ax in self._axs:
+            ax.clear()
+
+        # --- positions ---
+        ax_pos.plot(t[:k+1], xL[:k+1], "C0-", label="Leader (past)")
+        ax_pos.plot(t[:k+1],  x[:k+1], "C1-", label="Ego (past)")
+        ax_pos.plot(t[k:], xL[k:], "C0--", alpha=0.6, label="Leader (projected)")
+        ax_pos.plot(t[k:],  x[k:], "C1--", alpha=0.6, label="Ego (projected)")
+        ax_pos.axvline(t[k], color="k", linestyle=":")
+        ax_pos.set_ylabel("Position")
+        ax_pos.legend(loc="upper left")
+        ax_pos.grid(True)
+
+        # --- velocities ---
+        ax_vel.plot(t[:k+1], vL[:k+1], "C0-")
+        ax_vel.plot(t[:k+1],  v[:k+1], "C1-")
+        ax_vel.plot(t[k:], vL[k:], "C0--", alpha=0.6)
+        ax_vel.plot(t[k:],  v[k:], "C1--", alpha=0.6)
+        ax_vel.axvline(t[k], color="k", linestyle=":")
+        ax_vel.set_ylabel("Velocity")
+        ax_vel.grid(True)
+
+        # --- control + acceleration ---
+        uc = np.clip(base.control, base.u_min, base.u_max)
+        ax_u.plot(t[:k+1], uc[:k+1], "C2-", label="Applied control")
+        ax_u.plot(t[k:],   uc[k:],   "C2--", alpha=0.6, label="Planned control")
+        ax_u.plot(t[:k+1],  a[:k+1], "C3-", label="Acceleration history")
+        ax_u.plot(t[k:],    a[k:],   "C3--", alpha=0.6, label="Simulated acceleration")
+        ax_u.plot(t[:k+1], al[:k+1], "C4-", label="Leading accel history")
+        ax_u.plot(t[k:],   al[k:],   "C4--", alpha=0.6, label="Leading accel simulated")
+        k0 = max(0, k - base.chunk_micro)
+        ax_u.axvspan(t[k0], t[k], color="C2", alpha=0.2, label="applied chunk")
+        ax_u.axvline(t[k], color="k", linestyle=":")
+        ax_u.set_ylabel("Acceleration/Control")
+        ax_u.legend(loc="upper right")
+        ax_u.grid(True)
+
+        # --- phase portrait ---
+        ax_phase.plot(xL[:k+1] - x[:k+1], vL[:k+1] - v[:k+1], "C1-", label="Past")
+        ax_phase.plot(xL[k:]   - x[k:],   vL[k:]   - v[k:],   "C1--", alpha=0.6, label="Projected")
+        ax_phase.axvline(0, color="k", linestyle=":")
+        ax_phase.set_xlabel("Gap (xL - x)")
+        ax_phase.set_ylabel("Δv")
+        ax_phase.legend(loc="upper right")
+        ax_phase.grid(True)
+
+        # --- safety filter history ---
+        if hasattr(self, "_safety_history") and self._safety_history["t"]:
+            sh = self._safety_history
+            ax_safe.plot(sh["t"], sh["u_c"],       "C0-",  label="u_c (RL)")
+            ax_safe.plot(sh["t"], sh["u_safe"],    "C3-",  label="u_safe (CBF)")
+            ax_safe.plot(sh["t"], sh["u_target"],  "C4--", label="u_target (OV)")
+            ax_safe.plot(sh["t"], sh["u_applied"], "C2-",  linewidth=2, label="u_applied")
+        ax_safe.axvline(t[k], color="k", linestyle=":")
+        ax_safe.set_ylabel("Control (m/s²)")
+        ax_safe.set_xlabel("Time [s]")
+        ax_safe.set_title("Safety filter")
+        ax_safe.legend(loc="upper right")
+        ax_safe.grid(True)
+
+        self._fig.tight_layout()
+        self._fig.canvas.draw()
+        self._fig.canvas.flush_events()
+        clear_output(wait=True)
+        display(self._fig)
 
 
 if __name__ == "__main__":

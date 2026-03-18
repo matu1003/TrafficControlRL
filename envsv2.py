@@ -26,7 +26,7 @@ class SingleLaneEnv(gym.Env):
                  alpha_a=1.0,
                  alpha_v=1.0,
                  alpha_d=1.0,
-                 alphaV=2,
+                 alphaV=0.4,
                  al = 3
                  ):
         super(SingleLaneEnv, self).__init__()
@@ -53,18 +53,26 @@ class SingleLaneEnv(gym.Env):
         dtype = np.float32
         )
 
+        # Derived observation channels (all relative/normalized):
+        # 0: gap        = xL - x          ∈ [0, 1e6]
+        # 1: dv         = vL - v          ∈ [-v_max, v_max]
+        # 2: v (ego)    normalized        ∈ [v_min, v_max]
+        # 3: a (ego)    normalized        ∈ [a_min, a_max]
+        # 4: aL (lead)  future accel      ∈ [a_min, a_max]
         obs_low = np.array([
-            np.full((self.n_total,), -1e6, dtype=np.float32),
-            np.full((self.n_total,), self.v_min, dtype=np.float32),
-            np.full((self.n_total,), -1e6, dtype=np.float32),
-            np.full((self.n_total,), self.v_min, dtype=np.float32),
-            np.full((self.n_total,), self.a_min, dtype=np.float32)], dtype=np.float32)
+            np.full((self.n_total,), 0.0,         dtype=np.float32),  # gap >= 0
+            np.full((self.n_total,), -self.v_max, dtype=np.float32),  # dv
+            np.full((self.n_total,), self.v_min,  dtype=np.float32),  # v ego
+            np.full((self.n_total,), self.a_min,  dtype=np.float32),  # a ego
+            np.full((self.n_total,), self.a_min,  dtype=np.float32),  # aL lead
+        ], dtype=np.float32)
         obs_high = np.array([
-            np.full((self.n_total,), 1e6, dtype=np.float32),
-            np.full((self.n_total,), self.v_max, dtype=np.float32),
-            np.full((self.n_total,), 1e6, dtype=np.float32),
-            np.full((self.n_total,), self.v_max, dtype=np.float32),
-            np.full((self.n_total,), self.a_max, dtype=np.float32)], dtype=np.float32)
+            np.full((self.n_total,), 1e6,         dtype=np.float32),
+            np.full((self.n_total,), self.v_max,  dtype=np.float32),
+            np.full((self.n_total,), self.v_max,  dtype=np.float32),
+            np.full((self.n_total,), self.a_max,  dtype=np.float32),
+            np.full((self.n_total,), self.a_max,  dtype=np.float32),
+        ], dtype=np.float32)
         self.observation_space = gym.spaces.Dict({
             "traj": gym.spaces.Box(low=obs_low, high=obs_high, dtype=np.float32, shape=(5, self.n_total)),
             "t": gym.spaces.Box(low=0.0, high=self.T, shape=(1,), dtype=np.float32),
@@ -78,7 +86,7 @@ class SingleLaneEnv(gym.Env):
 
 
         
-        self.leading_al =  a_max/2 * (np.sin(al*t*np.pi/(self.n_total)))
+        self.leading_al =  a_max/2 * (1 + np.sin(al*t*np.pi/(self.n_total)))
 
         self.control = np.zeros(self.n_total)
         
@@ -176,7 +184,7 @@ class SingleLaneEnv(gym.Env):
         dxL = vL
         dvL = self.leading_al[i]
         dx = v
-        dv = self.alphaV * ( self.V(xL - x) - v) + u
+        # dv = self.alphaV * ( self.V(xL - x) - v) + u
         dv = u
         da = 0.0
         return np.array([dxL, dvL, dx, dv, da], dtype=np.float64)
@@ -184,16 +192,28 @@ class SingleLaneEnv(gym.Env):
     def compute_reward(self):
         xL, vL, x, v, a = self.state["traj"]
         
-        integrand = 0.5 * self.alpha_a * ((a/self.a_max)**2) - self.alpha_v * v/self.v_max + self.alpha_d * ((vL - v)/self.v_max)**2
-        # integrand = 0.5 * self.alpha_a * ((a/self.a_max)**2) - self.alpha_v * v/self.v_max
+        integrand = 0.5 * self.alpha_a * ((a/self.a_max)**2) - self.alpha_v * v/self.v_max
         
         reward = -np.trapz(integrand, dx=self.dt) / self.T 
         return reward
 
 
     def _get_obs(self):
-        traj = self.state["traj"].astype(np.float32, copy=False)
-        t = np.array([self.state["t"]], dtype=np.float32)  # shape (1,)
+        xL, vL, x, v, a = self.state["traj"]  # each shape (n_total,)
+
+        gap = xL - x                           # always >= 0 if no collision
+        dv  = vL - v                           # positive = leader faster
+        aL  = self.leading_al.astype(np.float32)
+
+        traj = np.stack([
+            gap.astype(np.float32),
+            dv.astype(np.float32),
+            v.astype(np.float32),
+            a.astype(np.float32),
+            aL,
+        ], axis=0)  # shape (5, n_total)
+
+        t = np.array([self.state["t"]], dtype=np.float32)
         return {"traj": traj, "t": t}
 
     def render(self):
